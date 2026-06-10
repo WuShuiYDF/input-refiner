@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-INSTALL_BIN="/usr/local/bin/refiner"
+INSTALL_BIN="$HOME/.local/bin/refiner"
 SYSTEMD_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 
 RED='\033[0;31m'
@@ -25,7 +25,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     systemctl --user daemon-reload 2>/dev/null || true
 
     # 删除软链
-    sudo rm -f "$INSTALL_BIN"
+    rm -f "$HOME/.local/bin/refiner"
 
     log "卸载完成"
     exit 0
@@ -43,17 +43,27 @@ fi
 log "Python $PYTHON_VER"
 
 # 2. 安装 Python 依赖
-for pkg in httpx pyyaml; do
-    if ! "$PYTHON" -c "import $pkg" 2>/dev/null; then
+for pkg_info in "httpx:httpx" "yaml:pyyaml"; do
+    import_name="${pkg_info%%:*}"
+    pkg="${pkg_info##*:}"
+    if ! "$PYTHON" -c "import $import_name" 2>/dev/null; then
         warn "安装 $pkg..."
-        "$PYTHON" -m pip install --user "$pkg" || err "安装 $pkg 失败"
+        "$PYTHON" -m pip install --user --break-system-packages "$pkg" || err "安装 $pkg 失败"
     fi
 done
 log "Python 依赖检查通过"
 
 # 3. 安装二进制
-sudo cp "$SCRIPT_DIR/refiner" "$INSTALL_BIN"
-sudo chmod +x "$INSTALL_BIN"
+mkdir -p "$(dirname "$INSTALL_BIN")"
+cp "$SCRIPT_DIR/refiner" "$INSTALL_BIN"
+chmod +x "$INSTALL_BIN"
+
+# 确保 ~/.local/bin 在 PATH 中
+if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+    warn "~/.local/bin 不在 PATH 中，已添加到 ~/.bashrc"
+    echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
+    export PATH="$HOME/.local/bin:$PATH"
+fi
 log "已安装: $INSTALL_BIN"
 
 # 4. 复制配置文件（如果不存在）
