@@ -48,4 +48,4 @@ log:
 hud:
   enabled: true
   status_file: /tmp/refiner-status.txt
-  max_display_len: 80
+  max_display_len: 0

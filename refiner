@@ -156,7 +156,10 @@ def update_hud(refined, config):
     if not config["hud"]["enabled"]:
         return
     max_len = config["hud"]["max_display_len"]
-    display = refined[:max_len] if len(refined) > max_len else refined
+    if max_len > 0 and len(refined) > max_len:
+        display = refined[:max_len]
+    else:
+        display = refined
     display = display.replace("\n", " ")
     try:
         Path(config["hud"]["status_file"]).write_text(display, encoding="utf-8")
