@@ -564,7 +564,7 @@ def cmd_setup(config, args):
         updated += 1
 
     db.commit()
-    # HUD 集成
+    # HUD 集成（在 db.close() 前）
     try:
         if _hud_integrate(db, port):
             print(f"  ✓ HUD 已集成")
@@ -572,6 +572,11 @@ def cmd_setup(config, args):
         print(f"  - HUD 配置异常: {e}")
 
     db.close()
+
+    # 重启 ccswitch 使 endpoint 变更生效
+    if updated > 0:
+        subprocess.run(["pkill", "-f", "cc-switch"], capture_output=True, timeout=5)
+        print(f"  ✓ ccswitch 已重启")
 
     print(f"\n完成: {updated} 个 provider 已接入, {skipped} 个跳过")
     print(f"\nrefiner 端口: {port}")
