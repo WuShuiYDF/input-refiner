@@ -181,15 +181,28 @@ def parse_upstream(path):
     return upstream, api_path or "/"
 
 
+def _is_tool_result(content):
+    """检测 content 是否包含 tool_result（工具输出，非用户真实输入）"""
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                return True
+    return False
+
+
 def _extract_text(content):
-    """提取消息文本，支持字符串和 content blocks 数组两种格式"""
+    """提取消息文本，支持字符串和 content blocks 数组两种格式。
+    跳过 tool_result 类型的 block"""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
         parts = []
         for block in content:
             if isinstance(block, dict):
-                t = block.get("text", "") or block.get("content", "")
+                # 跳过工具调用结果
+                if block.get("type") == "tool_result":
+                    continue
+                t = block.get("text", "")
                 if t:
                     parts.append(t)
         return " ".join(parts) if parts else ""
@@ -284,6 +297,12 @@ class RefinerHandler(BaseHTTPRequestHandler):
         for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "user":
                 content = messages[i].get("content", "")
+
+                # 跳过 tool_result（Bash/Edit 等工具的输出，非用户真实输入）
+                if _is_tool_result(content):
+                    logger.info("→ 跳过（工具输出）")
+                    break
+
                 # 支持字符串和 content blocks 数组两种格式
                 text = _extract_text(content)
                 if not text.strip():
