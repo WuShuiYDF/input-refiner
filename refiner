@@ -526,6 +526,14 @@ def _sync_settings_json(db):
         if key in provider_env:
             settings.setdefault("env", {})[key] = provider_env[key]
 
+    # 同步 statusLine（来自 common_config_claude）
+    cursor.execute("SELECT value FROM settings WHERE key='common_config_claude'")
+    common_row = cursor.fetchone()
+    if common_row:
+        common_cfg = json.loads(common_row[0])
+        if 'statusLine' in common_cfg:
+            settings['statusLine'] = common_cfg['statusLine']
+
     with open(settings_path, "w") as f:
         json.dump(settings, f, indent=2, ensure_ascii=False)
 
