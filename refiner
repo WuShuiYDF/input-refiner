@@ -414,79 +414,89 @@ def check_health(endpoint_base="http://localhost:8080", timeout=60):
 # ────────────────────────────────────────
 
 def _hud_integrate(db, port):
-    """Patch claude-hud 的 render/index.js，读取 refiner-status.txt"""
-    # 找到 claude-hud 的 render/index.js
-    hud_base = Path.home() / ".claude" / "plugins" / "cache" / "claude-hud"
-    dist_files = sorted(hud_base.glob("*/*/dist/render/index.js"), reverse=True)
-    if not dist_files:
+    """修改 common_config_claude 的 statusLine 命令，包裹 refiner HUD"""
+    cursor = db.cursor()
+    cursor.execute("SELECT value FROM settings WHERE key='common_config_claude'")
+    row = cursor.fetchone()
+    if not row:
+        return False
+    common = json.loads(row[0])
+
+    # 备份原始 statusLine
+    if '__refiner_statusline_original' not in common:
+        common['__refiner_statusline_original'] = json.dumps(common.get('statusLine', {}))
+
+    old_cmd = common.get('statusLine', {}).get('command', '')
+    if not old_cmd:
         return False
 
-    index_js = dist_files[0]
-    content = index_js.read_text(encoding="utf-8")
+    # 已包裹则跳过
+    if '/tmp/refiner-status.txt' in old_cmd:
+        return False
 
-    if '/tmp/refiner-status.txt' in content:
-        return False  # 已 patch
+    # 找到 exec "$NODE" "$INDEX" 并替换
+    import re
+    match = re.search(r'exec\s+("[^"]+")\s+("[^"]+")', old_cmd)
+    if not match:
+        return False
 
-    # 备份
-    backup = index_js.with_suffix(".js.bak")
-    if not backup.exists():
-        index_js.replace(backup)
+    node_path = match.group(1)
+    hud_index = match.group(2)
 
-    # 读取备份作为工作副本
-    src = backup.read_text(encoding="utf-8")
-
-    # 1) 添加 readFileSync import
-    src = src.replace(
-        "import { codePointCellWidth, isCjkAmbiguousWide } from './width.js';",
-        "import { codePointCellWidth, isCjkAmbiguousWide } from './width.js';\n"
-        "import { readFileSync } from 'node:fs';",
+    # 替换 exec 为：捕获 stdin → pipe 到 node → prepend refiner → 输出
+    inner = old_cmd[len("bash -c '"):-1]
+    new_suffix = (
+        f'STDIN=$(cat); '
+        f'OUT=$(echo "$STDIN" | {node_path} {hud_index} 2>/dev/null); '
+        f'RF=$(head -c 80 /tmp/refiner-status.txt 2>/dev/null | tr "\\n" " "); '
+        f'[ -n "$RF" ] && echo "✎ $RF"; '
+        f'echo "$OUT"'
     )
+    new_inner = inner.replace(f'exec {node_path} {hud_index}', new_suffix)
 
-    # 2) 在 render() 函数内添加 refiner 读取逻辑
-    render_start = "export function render(ctx) {\n"
-    refiner_block = (
-        render_start +
-        '    // input-refiner: prepend refined text from status file\n'
-        '    let refinerLine = "";\n'
-        '    try {\n'
-        "        const rf = readFileSync('/tmp/refiner-status.txt', 'utf-8').trim();\n"
-        '        if (rf && rf.length > 0) {\n'
-        "            const truncated = rf.length > 80 ? rf.slice(0, 80) + '...' : rf;\n"
-        "            refinerLine = `${customColor('✎ ' + truncated, ctx.config?.colors)}${RESET}`;\n"
-        '        }\n'
-        '    } catch (_) {}\n'
-        '    let lines;\n'
+    new_cmd = f"bash -c '{new_inner}'"
+    common['statusLine']['command'] = new_cmd
+    cursor.execute(
+        "UPDATE settings SET value = ? WHERE key = 'common_config_claude'",
+        (json.dumps(common, ensure_ascii=False),),
     )
-    src = src.replace(render_start + "    let lines;\n", refiner_block)
+    db.commit()
 
-    # 3) 在输出前插入 refinerLine
-    physical_start = "    const physicalLines = lines.flatMap(line => line.split('\\n'));\n"
-    physical_with_refiner = (
-        physical_start +
-        "    // input-refiner: prepend refiner line\n"
-        "    if (refinerLine) {\n"
-        "        physicalLines.unshift(refinerLine);\n"
-        "    }\n"
-    )
-    src = src.replace(physical_start, physical_with_refiner)
+    # 同步到 settings.json
+    _sync_settings_json(db)
 
-    index_js.write_text(src, encoding="utf-8")
     return True
 
 
 def _hud_restore(db):
-    """还原 claude-hud render/index.js"""
-    hud_base = Path.home() / ".claude" / "plugins" / "cache" / "claude-hud"
-    dist_files = sorted(hud_base.glob("*/*/dist/render/index.js"), reverse=True)
-    if not dist_files:
+    """还原 statusLine 命令"""
+    cursor = db.cursor()
+    cursor.execute("SELECT value FROM settings WHERE key='common_config_claude'")
+    row = cursor.fetchone()
+    if not row:
+        return False
+    common = json.loads(row[0])
+
+    backup = common.pop('__refiner_statusline_original', None)
+    if not backup:
         return False
 
-    index_js = dist_files[0]
-    backup = index_js.with_suffix(".js.bak")
-    if backup.exists():
-        backup.replace(index_js)
-        return True
-    return False
+    try:
+        original_sl = json.loads(backup)
+    except (json.JSONDecodeError, TypeError):
+        original_sl = {"type": "command", "command": backup}
+
+    common['statusLine'] = original_sl
+    cursor.execute(
+        "UPDATE settings SET value = ? WHERE key = 'common_config_claude'",
+        (json.dumps(common, ensure_ascii=False),),
+    )
+    db.commit()
+
+    # 同步到 settings.json
+    _sync_settings_json(db)
+
+    return True
 
 
 def _sync_settings_json(db):
