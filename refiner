@@ -486,6 +486,37 @@ def _hud_restore(db):
     return True
 
 
+def _sync_settings_json(db):
+    """将当前 provider 的 endpoint 同步到 ~/.claude/settings.json"""
+    cursor = db.cursor()
+    cursor.execute(
+        "SELECT settings_config FROM providers WHERE app_type='claude' AND is_current=1"
+    )
+    row = cursor.fetchone()
+    if not row:
+        return
+
+    provider_cfg = json.loads(row[0])
+    provider_env = provider_cfg.get("env", {})
+
+    settings_path = Path.home() / ".claude" / "settings.json"
+    try:
+        with open(settings_path) as f:
+            settings = json.load(f)
+    except Exception:
+        return
+
+    # 只更新 env 中的请求端点
+    for key in ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_MODEL"]:
+        if key in provider_env:
+            settings.setdefault("env", {})[key] = provider_env[key]
+
+    with open(settings_path, "w") as f:
+        json.dump(settings, f, indent=2, ensure_ascii=False)
+
+
 def cmd_setup(config, args):
     """一键接入：遍历 ccswitch 所有 provider，endpoint 指向 refiner"""
     port = getattr(args, "port", 18888)
@@ -571,6 +602,9 @@ def cmd_setup(config, args):
     except Exception as e:
         print(f"  - HUD 配置异常: {e}")
 
+    # 同步到 ~/.claude/settings.json（Claude Code 实际读的是这个文件）
+    _sync_settings_json(db)
+
     db.close()
 
     # 重启 ccswitch 使 endpoint 变更生效
@@ -628,6 +662,9 @@ def cmd_teardown(config, args):
     # 还原 HUD
     if _hud_restore(db):
         print(f"  ✓ HUD 已还原")
+
+    # 同步 settings.json
+    _sync_settings_json(db)
 
     db.close()
 
