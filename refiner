@@ -181,6 +181,22 @@ def parse_upstream(path):
     return upstream, api_path or "/"
 
 
+def _should_skip_refinement(content, config):
+    """跳过非用户输入：系统指令、agent prompt、过长的上下文"""
+    # 太长 = 非用户输入（agent 指令 / 上下文片段）
+    if len(content) > 1000:
+        return True
+    # 系统模式
+    skip_patterns = [
+        "SUGGESTION MODE", "[SUGGESTION", "You are a",
+        "Base directory for this skill",
+    ]
+    for p in skip_patterns:
+        if p.lower() in content.lower():
+            return True
+    return False
+
+
 class RefinerHandler(BaseHTTPRequestHandler):
     config = None
     logger = None
@@ -228,22 +244,30 @@ class RefinerHandler(BaseHTTPRequestHandler):
         for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "user":
                 content = messages[i].get("content", "")
-                if isinstance(content, str) and content.strip():
-                    skip_prefix = config["skip_prefix"]
-                    if skip_prefix and content.startswith(skip_prefix):
-                        messages[i]["content"] = content[len(skip_prefix):].lstrip()
-                        logger.info("跳过精炼 (%s)", skip_prefix)
-                    else:
-                        logger.info("精炼中... (%d 字符)", len(content))
-                        start = time.time()
-                        refined_text = refine(content, config)
-                        elapsed = time.time() - start
-                        logger.info("精炼完成 (%.1fs): %d → %d 字符",
-                                    elapsed, len(content), len(refined_text))
-                        log_refinement(content, refined_text, config)
-                        update_hud(refined_text, config)
-                        messages[i]["content"] = refined_text
-                        refined = True
+                if not isinstance(content, str) or not content.strip():
+                    break
+
+                # 跳过非用户输入（系统指令、agent prompt 等）
+                if _should_skip_refinement(content, config):
+                    logger.info("跳过精炼（非用户输入，%d 字符）", len(content))
+                    break
+
+                skip_prefix = config["skip_prefix"]
+                if skip_prefix and content.startswith(skip_prefix):
+                    messages[i]["content"] = content[len(skip_prefix):].lstrip()
+                    logger.info("跳过精炼 (%s)", skip_prefix)
+                else:
+                    logger.info("精炼中... (%d 字符)", len(content))
+                    start = time.time()
+                    refined_text = refine(content, config)
+                    elapsed = time.time() - start
+                    logger.info("精炼完成 (%.1fs): %d → %d 字符",
+                                elapsed, len(content), len(refined_text))
+                    log_refinement(content, refined_text, config)
+                    # 始终更新 HUD 和消息（即使文本未变）
+                    update_hud(refined_text, config)
+                    messages[i]["content"] = refined_text
+                    refined = True
                 break
 
         if refined:
