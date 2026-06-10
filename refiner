@@ -181,6 +181,44 @@ def parse_upstream(path):
     return upstream, api_path or "/"
 
 
+def _extract_text(content):
+    """提取消息文本，支持字符串和 content blocks 数组两种格式"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                t = block.get("text", "") or block.get("content", "")
+                if t:
+                    parts.append(t)
+        return " ".join(parts) if parts else ""
+    return str(content) if content else ""
+
+
+def _update_content(original_content, new_text):
+    """用精炼后文本更新 content，保持原格式"""
+    if isinstance(original_content, str):
+        return new_text
+    if isinstance(original_content, list):
+        updated = False
+        for block in original_content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                if block.get("text") is not None:
+                    block["text"] = new_text
+                    updated = True
+        # fallback: 若没有 text block，替换第一个 block 的 text/content
+        if not updated and original_content:
+            first = original_content[0]
+            if isinstance(first, dict):
+                if "text" in first:
+                    first["text"] = new_text
+                else:
+                    first["text"] = new_text
+        return original_content
+    return new_text
+
+
 def _should_skip_refinement(content, config):
     """跳过非用户输入：系统指令、agent prompt、过长的上下文"""
     # 太长 = 非用户输入（agent 指令 / 上下文片段）
@@ -202,7 +240,7 @@ class RefinerHandler(BaseHTTPRequestHandler):
     logger = None
 
     def log_message(self, fmt, *args):
-        self.logger.debug("HTTP %s", fmt % args)
+        self.logger.info("HTTP %s", fmt % args)
 
     def do_POST(self):
         config = self.config
@@ -215,10 +253,10 @@ class RefinerHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(b'{"error":"invalid proxy path"}')
+            logger.info("POST %s → 400 (parse failed)", self.path)
             return
 
         target_url = f"{upstream}{api_path}"
-        logger.debug("上游: %s", target_url)
 
         # 读请求体
         length = int(self.headers.get("Content-Length", 0))
@@ -240,35 +278,45 @@ class RefinerHandler(BaseHTTPRequestHandler):
 
         # 精炼最后一条 user message
         messages = data.get("messages", [])
+        logger.info("POST %s | %d messages | %d bytes",
+                    self.path, len(messages), length)
         refined = False
         for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "user":
                 content = messages[i].get("content", "")
-                if not isinstance(content, str) or not content.strip():
+                # 支持字符串和 content blocks 数组两种格式
+                text = _extract_text(content)
+                if not text.strip():
+                    logger.info("→ 跳过（空消息）")
                     break
 
                 # 跳过非用户输入（系统指令、agent prompt 等）
-                if _should_skip_refinement(content, config):
-                    logger.info("跳过精炼（非用户输入，%d 字符）", len(content))
+                if _should_skip_refinement(text, config):
+                    logger.info("→ 跳过（非用户输入，%d 字符，前60字: %s）",
+                               len(text), text[:60])
                     break
 
                 skip_prefix = config["skip_prefix"]
-                if skip_prefix and content.startswith(skip_prefix):
-                    messages[i]["content"] = content[len(skip_prefix):].lstrip()
-                    logger.info("跳过精炼 (%s)", skip_prefix)
+                if skip_prefix and text.startswith(skip_prefix):
+                    stripped = text[len(skip_prefix):].lstrip()
+                    messages[i]["content"] = _update_content(content, stripped)
+                    logger.info("→ 跳过 (prefix %s)", skip_prefix)
                 else:
-                    logger.info("精炼中... (%d 字符)", len(content))
+                    logger.info("→ 精炼中... (%d 字符: %s)",
+                               len(text), text[:60])
                     start = time.time()
-                    refined_text = refine(content, config)
+                    refined_text = refine(text, config)
                     elapsed = time.time() - start
-                    logger.info("精炼完成 (%.1fs): %d → %d 字符",
-                                elapsed, len(content), len(refined_text))
-                    log_refinement(content, refined_text, config)
+                    logger.info("→ 精炼完成 (%.1fs): %d → %d 字符",
+                                elapsed, len(text), len(refined_text))
+                    log_refinement(text, refined_text, config)
                     # 始终更新 HUD 和消息（即使文本未变）
                     update_hud(refined_text, config)
-                    messages[i]["content"] = refined_text
+                    messages[i]["content"] = _update_content(content, refined_text)
                     refined = True
                 break
+        else:
+            logger.info("→ 无 user message，直接转发")
 
         if refined:
             data["messages"] = messages
