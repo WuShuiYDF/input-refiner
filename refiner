@@ -43,7 +43,10 @@ DEFAULT_CONFIG = {
         - 输入已足够清晰 → 原样输出
     """),
     "skip_prefix": "!!!",
-    "upstream": "auto",
+    "upstream": {
+        "default": "https://api.deepseek.com/anthropic",
+        "map": {},
+    },
     "scope": {"apps": []},
     "log": {
         "path": str(Path.home() / ".cc-switch" / "logs" / "refiner.log"),
@@ -104,10 +107,21 @@ def load_config():
     return cfg
 
 
-def detect_upstream(api_key, upstream_setting):
-    """解析上游 URL"""
-    if upstream_setting and upstream_setting != "auto":
-        return upstream_setting.rstrip("/")
+def detect_upstream(api_key, upstream_config):
+    """解析上游 URL — 优先查 map 表（API key 前缀匹配），兜底 default"""
+    if isinstance(upstream_config, str):
+        if upstream_config and upstream_config != "auto":
+            return upstream_config.rstrip("/")
+    elif isinstance(upstream_config, dict):
+        api_map = upstream_config.get("map", {})
+        for prefix, url in api_map.items():
+            if (api_key or "").startswith(prefix):
+                return url.rstrip("/")
+        default = upstream_config.get("default", "")
+        if default:
+            return default.rstrip("/")
+
+    # 最终兜底：旧式前缀匹配
     for pattern, url in UPSTREAM_RULES:
         if re.match(pattern, api_key or ""):
             return url
