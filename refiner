@@ -1,0 +1,642 @@
+#!/usr/bin/env python3
+"""input-refiner — 本地模型输入精炼代理
+
+子命令:
+  refiner serve        启动 HTTP 代理 (默认 :18888)
+  refiner models       列出可用 gguf 模型
+  refiner switch NAME  切换到指定模型
+  refiner status       查看当前状态
+"""
+
+import argparse
+import json
+import logging
+import os
+import re
+import signal
+import subprocess
+import sys
+import textwrap
+import threading
+import time
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
+from urllib.parse import urlparse
+
+# ── 默认配置 ──
+DEFAULT_CONFIG = {
+    "refiner": {
+        "endpoint": "http://localhost:8080/v1/chat/completions",
+        "models_dir": str(Path.home() / "models"),
+        "current_model": "auto",
+        "timeout": 5,
+        "max_tokens": 256,
+    },
+    "prompt": textwrap.dedent("""\
+        你是输入精炼器。接收用户原始输入，输出一条清晰完整的指令。
+
+        规则：
+        - 去除闲聊、客套、重复、口头禅
+        - 补全模糊指代（"那个项目""上次的bug"→具体描述）
+        - 保留所有技术细节（文件名、命令、参数、版本号）
+        - 不回答、不评价、不解释，只输出精炼后的指令
+        - 输入已足够清晰 → 原样输出
+    """),
+    "skip_prefix": "!!!",
+    "upstream": "auto",
+    "scope": {"apps": []},
+    "log": {
+        "path": str(Path.home() / ".cc-switch" / "logs" / "refiner.log"),
+        "max_lines": 2000,
+    },
+    "hud": {
+        "enabled": True,
+        "status_file": "/tmp/refiner-status.txt",
+        "max_display_len": 80,
+    },
+}
+
+# 上游 API 自动检测映射
+UPSTREAM_RULES = [
+    (r"^ark-", "https://ark.cn-beijing.volces.com/api/coding"),
+    (r"^sk-.*dashscope", "https://dashscope.aliyuncs.com/apps/anthropic"),
+    (r"^sk-", "https://api.deepseek.com/anthropic"),
+]
+
+# ────────────────────────────────────────
+# 配置
+# ────────────────────────────────────────
+
+def find_config():
+    """搜索 config.yaml，优先级: 当前目录 > ~/.config/input-refiner > ~/input-refiner > 内置"""
+    paths = [
+        Path("config.yaml"),
+        Path.home() / ".config" / "input-refiner" / "config.yaml",
+        Path(__file__).resolve().parent / "config.yaml",
+    ]
+    for p in paths:
+        if p.exists():
+            return p
+    return None
+
+
+def load_config():
+    """加载配置，文件缺失时返回内置默认值"""
+    cfg_path = find_config()
+    if cfg_path is None:
+        return dict(DEFAULT_CONFIG)
+
+    try:
+        import yaml
+    except ImportError:
+        return dict(DEFAULT_CONFIG)
+
+    with open(cfg_path) as f:
+        user = yaml.safe_load(f) or {}
+
+    # 深度合并
+    cfg = dict(DEFAULT_CONFIG)
+    for section in cfg:
+        if section in user and isinstance(user[section], dict):
+            cfg[section] = {**cfg[section], **user[section]}
+        elif section in user:
+            cfg[section] = user[section]
+    return cfg
+
+
+def detect_upstream(api_key, upstream_setting):
+    """解析上游 URL"""
+    if upstream_setting and upstream_setting != "auto":
+        return upstream_setting.rstrip("/")
+    for pattern, url in UPSTREAM_RULES:
+        if re.match(pattern, api_key or ""):
+            return url
+    return "https://api.deepseek.com/anthropic"
+
+
+# ────────────────────────────────────────
+# HTTP 代理
+# ────────────────────────────────────────
+
+def refine(text, config):
+    """调用本地模型精炼文本，失败时返回原文本"""
+    endpoint = config["refiner"]["endpoint"]
+    prompt = config["prompt"]
+    timeout = config["refiner"]["timeout"]
+    max_tokens = config["refiner"]["max_tokens"]
+
+    try:
+        import httpx
+
+        # 用 completions 端点（绕过 gemma 等模型的 thinking 模式）
+        completions_url = endpoint.rsplit("/chat/completions", 1)[0] + "/completions"
+        completion_prompt = (
+            f"{prompt}\n\n"
+            f"输入：{text}\n\n"
+            f"输出："
+        )
+
+        resp = httpx.post(
+            completions_url,
+            json={
+                "prompt": completion_prompt,
+                "max_tokens": max_tokens,
+                "temperature": 0.1,
+                "stop": ["\n\n", "。\n"],
+            },
+            timeout=timeout + 2,
+            proxy=None, trust_env=False,
+        )
+        if resp.status_code == 200:
+            body = resp.json()
+            result = body["choices"][0].get("text", "").strip()
+            if result and result != text:
+                return result
+    except Exception as e:
+        logging.getLogger("refiner").warning("精炼失败: %s", e)
+
+    return text
+
+
+def log_refinement(original, refined, config):
+    """写日志文件"""
+    path = Path(config["log"]["path"])
+    max_lines = config["log"]["max_lines"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    entry = (
+        f"[{time.strftime('%H:%M:%S')}] "
+        f"原文: {original[:200]}\n"
+        f"      精炼: {refined[:200]}\n"
+        f"      节省: {max(0, len(original) - len(refined))} 字符\n"
+    )
+
+    lines = []
+    if path.exists():
+        lines = path.read_text(encoding="utf-8").splitlines()
+    lines.append(entry)
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def update_hud(refined, config):
+    """写 HUD 状态文件"""
+    if not config["hud"]["enabled"]:
+        return
+    max_len = config["hud"]["max_display_len"]
+    display = refined[:max_len] if len(refined) > max_len else refined
+    display = display.replace("\n", " ")
+    try:
+        Path(config["hud"]["status_file"]).write_text(display, encoding="utf-8")
+    except Exception:
+        pass
+
+
+class RefinerHandler(BaseHTTPRequestHandler):
+    """HTTP 请求处理器 — 先精炼，再透传"""
+
+    # 类级别注入配置和日志
+    config = None
+    logger = None
+
+    def log_message(self, fmt, *args):
+        self.logger.debug("HTTP %s", fmt % args)
+
+    def do_POST(self):
+        config = self.config
+        logger = self.logger
+
+        # 读取请求体
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
+
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            self._proxy_raw(body)
+            return
+
+        # scope 检查
+        apps_scope = config["scope"].get("apps", [])
+        if apps_scope:
+            # 从 User-Agent 或自定义头判断 app
+            ua = self.headers.get("User-Agent", "")
+            app_match = any(a.lower() in ua.lower() for a in apps_scope)
+            if not app_match:
+                self._proxy_raw(body, data)
+                return
+
+        # 提取 + 精炼最后一条 user message
+        messages = data.get("messages", [])
+        refined = False
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                content = messages[i].get("content", "")
+                if isinstance(content, str) and content.strip():
+                    skip_prefix = config["skip_prefix"]
+                    if skip_prefix and content.startswith(skip_prefix):
+                        messages[i]["content"] = content[len(skip_prefix):].lstrip()
+                        logger.info("跳过精炼 (%s 前缀)", skip_prefix)
+                    else:
+                        logger.info("精炼中... (%d 字符)", len(content))
+                        start = time.time()
+                        refined_text = refine(content, config)
+                        elapsed = time.time() - start
+                        logger.info(
+                            "精炼完成 (%.1fs): %d → %d 字符",
+                            elapsed, len(content), len(refined_text),
+                        )
+                        log_refinement(content, refined_text, config)
+                        update_hud(refined_text, config)
+                        messages[i]["content"] = refined_text
+                        refined = True
+                break
+
+        if refined:
+            data["messages"] = messages
+            body = json.dumps(data).encode("utf-8")
+
+        self._proxy_raw(body, data, refined)
+
+    def _proxy_raw(self, body, data=None, was_refined=False):
+        """转发请求到上游并流式返回"""
+        config = self.config
+        logger = self.logger
+
+        # 解析上游
+        api_key = self.headers.get("x-api-key", "")
+        if data is not None and "upstream" in data.get("__meta__", {}):
+            upstream = data["__meta__"]["upstream"]
+        else:
+            upstream = detect_upstream(api_key, config.get("upstream", "auto"))
+
+        # 目标 URL — 保持原路径
+        target_path = self.path
+        target_url = f"{upstream}{target_path}"
+
+        # 构造请求头（透传但去掉 hop-by-hop）
+        fwd_headers = {}
+        skip = {"host", "connection", "transfer-encoding", "keep-alive", "proxy-connection",
+                "proxy-authenticate", "proxy-authorization", "te", "trailer", "upgrade"}
+        for k, v in self.headers.items():
+            if k.lower() not in skip:
+                fwd_headers[k] = v
+
+        # 修正 Content-Length（精炼后 body 长度可能变化）
+        for k in list(fwd_headers.keys()):
+            if k.lower() == "content-length":
+                del fwd_headers[k]
+        fwd_headers["Content-Length"] = str(len(body))
+
+        try:
+            import httpx
+
+            with httpx.stream(
+                "POST", target_url,
+                headers=fwd_headers,
+                content=body,
+                timeout=config["refiner"]["timeout"] + 120,
+                proxy=None, trust_env=False,
+            ) as resp:
+                # 回传状态码
+                self.send_response(resp.status_code)
+
+                # 回传响应头
+                for k, v in resp.headers.items():
+                    if k.lower() not in skip:
+                        self.send_header(k, v)
+
+                # 添加精炼标记头（调试用）
+                if was_refined:
+                    self.send_header("X-Refiner-Processed", "1")
+
+                self.end_headers()
+
+                # 流式回传 body
+                for chunk in resp.iter_bytes(8192):
+                    try:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+
+        except Exception as e:
+            logger.error("上游请求失败: %s", e)
+            try:
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                err = json.dumps({"error": f"input-refiner: upstream unreachable: {e}"})
+                self.wfile.write(err.encode())
+            except Exception:
+                pass
+
+    def do_GET(self):
+        """健康检查"""
+        if self.path == "/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok","service":"input-refiner"}')
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Allow", "POST, GET, OPTIONS")
+        self.end_headers()
+
+
+# ────────────────────────────────────────
+# 模型管理
+# ────────────────────────────────────────
+
+def get_docker_container():
+    """找到 llama.cpp Docker 容器"""
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}",
+             "--filter", "publish=8080"],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.strip().splitlines():
+            if line:
+                cid, name, image = line.split("\t")
+                if "llama" in image.lower() or "llama" in name.lower():
+                    return cid, name, image
+    except Exception:
+        pass
+    return None, None, None
+
+
+def get_container_config(container_id):
+    """获取容器的挂载信息和当前模型路径"""
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", container_id],
+            capture_output=True, text=True, timeout=5
+        )
+        info = json.loads(result.stdout)[0]
+        mounts = {}
+        for m in info.get("Mounts", []):
+            mounts[m["Destination"]] = m["Source"]
+        cmd = info["Config"]["Cmd"] or []
+        current_model = None
+        for i, arg in enumerate(cmd):
+            if arg == "--model" and i + 1 < len(cmd):
+                current_model = cmd[i + 1]
+        return mounts, current_model
+    except Exception:
+        return {}, None
+
+
+def list_models(models_dir):
+    """列出所有 gguf 文件"""
+    path = Path(models_dir)
+    if not path.exists():
+        return []
+    models = sorted(path.glob("*.gguf"))
+    return models
+
+
+def check_health(endpoint_base="http://localhost:8080", timeout=60):
+    """等待本地模型就绪"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            import httpx
+            resp = httpx.get(f"{endpoint_base}/health", timeout=3, proxy=None, trust_env=False)
+            if resp.status_code == 200:
+                return True
+        except Exception:
+            pass
+        time.sleep(1)
+    return False
+
+
+# ────────────────────────────────────────
+# CLI
+# ────────────────────────────────────────
+
+def cmd_serve(config, args):
+    """启动 HTTP 代理服务"""
+    port = getattr(args, "port", 18888)
+    host = getattr(args, "bind", "127.0.0.1")
+
+    # 配置日志
+    logger = logging.getLogger("refiner")
+    logger.setLevel(logging.DEBUG if getattr(args, "verbose", False) else logging.INFO)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"
+    ))
+    logger.handlers = [handler]
+
+    # 注入到 handler 类
+    RefinerHandler.config = config
+    RefinerHandler.logger = logger
+
+    server = HTTPServer((host, port), RefinerHandler)
+
+    def shutdown(sig, frame):
+        logger.info("正在关闭...")
+        server.shutdown()
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    logger.info("input-refiner 已启动 → http://%s:%d", host, port)
+    logger.info("精炼端点: %s", config["refiner"]["endpoint"])
+    logger.info("上游模式: %s", config.get("upstream", "auto"))
+    logger.info("跳过前缀: %s", config.get("skip_prefix", "!!!"))
+    logger.info("")
+    logger.info("ccswitch provider endpoint 请设置为: http://%s:%d/v1/messages", host, port)
+    logger.info("健康检查: http://%s:%d/health", host, port)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+        logger.info("已停止")
+
+
+def cmd_models(config, args):
+    """列出所有可用模型"""
+    models_dir = config["refiner"]["models_dir"]
+    models = list_models(models_dir)
+
+    if not models:
+        print(f"在 {models_dir} 下未找到 .gguf 文件")
+        return
+
+    cid = get_docker_container()[0] or ""
+    _, current_model_path = get_container_config(cid) if cid else ({}, None)
+    current_name = Path(current_model_path).stem if current_model_path else None
+
+    print(f"可用模型 ({models_dir}):\n")
+    for i, m in enumerate(models, 1):
+        size_gb = m.stat().st_size / (1024 ** 3)
+        marker = " ← 当前" if (current_model_path and m.name in str(current_model_path)) else ""
+        print(f"  {i}. {m.name}  ({size_gb:.1f} GB){marker}")
+
+
+def cmd_switch(config, args):
+    """切换模型 — 重启 Docker 容器"""
+    target = args.name
+    models_dir = config["refiner"]["models_dir"]
+    models = list_models(models_dir)
+
+    match = None
+    for m in models:
+        if target in m.name or target == m.stem:
+            match = m
+            break
+
+    if match is None:
+        print(f"未找到匹配 '{target}' 的模型。可用模型:")
+        for m in models:
+            print(f"  {m.stem}")
+        sys.exit(1)
+
+    cid, cname, cimage = get_docker_container()
+    if cid is None:
+        print("未找到运行中的 llama.cpp Docker 容器")
+        print(f"请手动启动并指定模型: --model /models/{match.name}")
+        sys.exit(1)
+
+    # 获取当前容器的完整命令
+    result = subprocess.run(
+        ["docker", "inspect", cid], capture_output=True, text=True, timeout=5
+    )
+    info = json.loads(result.stdout)[0]
+    entrypoint = info["Config"].get("Entrypoint") or []
+    old_cmd = info["Config"].get("Cmd") or []
+    full_cmd = entrypoint + old_cmd
+
+    # 替换 --model 参数
+    new_cmd = []
+    skip = False
+    for arg in full_cmd:
+        if skip:
+            skip = False
+            continue
+        if arg == "--model":
+            new_cmd.extend(["--model", f"/models/{match.name}"])
+            skip = True
+        else:
+            new_cmd.append(arg)
+
+    # 提取挂载和端口映射用于重建
+    mounts_args = []
+    for mnt in info.get("Mounts", []):
+        mounts_args.extend(["-v", f"{mnt['Source']}:{mnt['Destination']}"])
+
+    port_args = []
+    for container_port, bindings in info.get("HostConfig", {}).get("PortBindings", {}).items():
+        for b in (bindings or []):
+            port_args.extend(["-p", f"{b['HostPort']}:{container_port.split('/')[0]}"])
+
+    env_args = []
+    for e in info["Config"].get("Env", []):
+        env_args.extend(["-e", e])
+
+    gpu_args = []
+    for dev in info.get("HostConfig", {}).get("DeviceRequests", []):
+        if dev.get("Driver") == "nvidia":
+            gpu_args = ["--gpus", "all"]
+            break
+
+    # 先 rm 旧容器，再启动新的
+    print(f"停止并删除旧容器 {cname}...")
+    subprocess.run(["docker", "stop", cid], capture_output=True, timeout=30)
+    subprocess.run(["docker", "rm", cid], capture_output=True, timeout=10)
+
+    run_cmd = ["docker", "run", "-d", "--name", cname] + gpu_args + port_args + mounts_args + env_args + [cimage] + new_cmd
+
+    print(f"启动新容器 {cname}，模型: {match.name}...")
+    result = subprocess.run(run_cmd, capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        print(f"启动失败:\n{result.stderr}")
+        sys.exit(1)
+
+    new_cid = result.stdout.strip()[:12]
+    print(f"容器 {new_cid} 已启动")
+
+    # 等待就绪
+    print("等待模型加载", end="", flush=True)
+    if check_health(timeout=120):
+        print(" ✓")
+        print(f"已切换到 {match.stem}")
+    else:
+        print(f" ⚠ 超时，请检查: docker logs {cname}")
+
+
+def cmd_status(config, args):
+    """查看当前状态"""
+    cid, cname, cimage = get_docker_container()
+
+    print("input-refiner 状态\n")
+    print(f"{'本地容器:':<16} {cname or '未运行'} ({cimage or '-'})")
+    print(f"{'容器 ID:':<16} {cid or '-'}")
+
+    if cid:
+        _, current = get_container_config(cid)
+        print(f"{'当前模型:':<16} {Path(current).stem if current else '未知'}")
+
+    # 健康检查
+    healthy = check_health(timeout=3)
+    print(f"{'健康状态:':<16} {'✓ 正常' if healthy else '✗ 不可达'}")
+
+    # refiner 代理状态
+    try:
+        from httpx import get as httpx_get
+        resp = httpx_get("http://localhost:18888/health", timeout=2, proxy=None, trust_env=False)
+        print(f"{'refiner 代理:':<16} {'✓ 运行中' if resp.status_code == 200 else '✗ 异常'}")
+    except Exception:
+        print(f"{'refiner 代理:':<16} {'✗ 未运行'}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="input-refiner — 本地模型输入精炼代理")
+    sub = parser.add_subparsers(dest="command")
+
+    # serve
+    p_serve = sub.add_parser("serve", help="启动 HTTP 代理")
+    p_serve.add_argument("--port", type=int, default=18888, help="监听端口 (默认 18888)")
+    p_serve.add_argument("--bind", default="127.0.0.1", help="绑定地址 (默认 127.0.0.1)")
+    p_serve.add_argument("-v", "--verbose", action="store_true", help="调试模式")
+
+    # models
+    sub.add_parser("models", help="列出可用 gguf 模型")
+
+    # switch
+    p_switch = sub.add_parser("switch", help="切换模型")
+    p_switch.add_argument("name", help="模型名 (模糊匹配)")
+
+    # status
+    sub.add_parser("status", help="查看当前状态")
+
+    args = parser.parse_args()
+
+    if args.command is None:
+        parser.print_help()
+        sys.exit(1)
+
+    config = load_config()
+
+    if args.command == "serve":
+        cmd_serve(config, args)
+    elif args.command == "models":
+        cmd_models(config, args)
+    elif args.command == "switch":
+        cmd_switch(config, args)
+    elif args.command == "status":
+        cmd_status(config, args)
+
+
+if __name__ == "__main__":
+    main()
