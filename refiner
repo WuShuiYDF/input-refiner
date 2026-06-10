@@ -389,6 +389,99 @@ def check_health(endpoint_base="http://localhost:8080", timeout=60):
 # setup / teardown
 # ────────────────────────────────────────
 
+def _hud_integrate(db, port):
+    """修改 common_config_claude 的 statusLine，加入 refiner HUD"""
+    cursor = db.cursor()
+    cursor.execute("SELECT value FROM settings WHERE key='common_config_claude'")
+    row = cursor.fetchone()
+    if not row:
+        return False
+    common = json.loads(row[0])
+
+    # 备份原始 statusLine
+    if '__refiner_statusline_original' not in common:
+        common['__refiner_statusline_original'] = json.dumps(common.get('statusLine', {}))
+
+    old_cmd = common.get('statusLine', {}).get('command', '')
+    if not old_cmd:
+        return False
+
+    # 已有 refiner HUD 则跳过
+    if 'refiner-status.txt' in old_cmd:
+        return False
+
+    # 包装原命令：exec "$node" "$plugin" → OUT=$("$node" "$plugin"); prepend refiner
+    import re
+    match = re.search(r'exec\s+("[^"]+"\s+"[^"]+")', old_cmd)
+    if not match:
+        return False
+
+    exec_part = match.group(1)
+    inner = old_cmd[len("bash -c '"):-1]
+    new_inner = inner.replace(
+        f"exec {exec_part}",
+        f'OUT=$({exec_part}); '
+        f'RF=$(head -c 80 /tmp/refiner-status.txt 2>/dev/null); '
+        f'[ -n "$RF" ] && echo "✎ $RF │ $OUT" || echo "$OUT"'
+    )
+    new_cmd = f"bash -c '{new_inner}'"
+
+    common['statusLine']['command'] = new_cmd
+    cursor.execute(
+        "UPDATE settings SET value = ? WHERE key = 'common_config_claude'",
+        (json.dumps(common, ensure_ascii=False),),
+    )
+    db.commit()
+
+    # 同步更新当前 settings.json
+    try:
+        settings_path = Path.home() / ".claude" / "settings.json"
+        with open(settings_path) as f:
+            settings = json.load(f)
+        settings['statusLine'] = common['statusLine']
+        with open(settings_path, 'w') as f:
+            json.dump(settings, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+    return True
+
+
+def _hud_restore(db):
+    """还原 statusLine"""
+    cursor = db.cursor()
+    cursor.execute("SELECT value FROM settings WHERE key='common_config_claude'")
+    row = cursor.fetchone()
+    if not row:
+        return False
+    common = json.loads(row[0])
+
+    backup = common.pop('__refiner_statusline_original', None)
+    if not backup:
+        return False
+
+    original_sl = json.loads(backup)
+    common['statusLine'] = original_sl
+    cursor.execute(
+        "UPDATE settings SET value = ? WHERE key = 'common_config_claude'",
+        (json.dumps(common, ensure_ascii=False),),
+    )
+    db.commit()
+
+    # 同步恢复 settings.json
+    try:
+        settings_path = Path.home() / ".claude" / "settings.json"
+        with open(settings_path) as f:
+            settings = json.load(f)
+        settings['statusLine'] = common['statusLine']
+        with open(settings_path, 'w') as f:
+            json.dump(settings, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+    return True
+
+
 def cmd_setup(config, args):
     """一键接入：遍历 ccswitch 所有 provider，endpoint 指向 refiner"""
     port = getattr(args, "port", 18888)
@@ -469,6 +562,12 @@ def cmd_setup(config, args):
     db.commit()
     db.close()
 
+    # HUD 集成
+    if _hud_integrate(db, port):
+        print(f"  ✓ HUD 已集成")
+    else:
+        print(f"  - HUD 已集成或无需更新")
+
     print(f"\n完成: {updated} 个 provider 已接入, {skipped} 个跳过")
     print(f"\nrefiner 端口: {port}")
     print(f"还原命令: refiner teardown")
@@ -515,6 +614,11 @@ def cmd_teardown(config, args):
         restored += 1
 
     db.commit()
+
+    # 还原 HUD
+    if _hud_restore(db):
+        print(f"  ✓ HUD 已还原")
+
     db.close()
 
     print(f"\n完成: {restored} 个 provider 已还原")
