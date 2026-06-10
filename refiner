@@ -2,10 +2,12 @@
 """input-refiner — 本地模型输入精炼代理
 
 子命令:
-  refiner serve        启动 HTTP 代理 (默认 :18888)
-  refiner models       列出可用 gguf 模型
-  refiner switch NAME  切换到指定模型
-  refiner status       查看当前状态
+  refiner setup          一键接入（自动修改 ccswitch 所有 provider endpoint）
+  refiner teardown       一键还原
+  refiner serve          启动 HTTP 代理 (默认 :18888)
+  refiner models         列出可用 gguf 模型
+  refiner switch NAME    切换到指定模型
+  refiner status         查看当前状态
 """
 
 import argparse
@@ -14,14 +16,13 @@ import logging
 import os
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import textwrap
-import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import urlparse
 
 # ── 默认配置 ──
 DEFAULT_CONFIG = {
@@ -43,10 +44,6 @@ DEFAULT_CONFIG = {
         - 输入已足够清晰 → 原样输出
     """),
     "skip_prefix": "!!!",
-    "upstream": {
-        "default": "https://api.deepseek.com/anthropic",
-        "map": {},
-    },
     "scope": {"apps": []},
     "log": {
         "path": str(Path.home() / ".cc-switch" / "logs" / "refiner.log"),
@@ -59,19 +56,13 @@ DEFAULT_CONFIG = {
     },
 }
 
-# 上游 API 自动检测映射
-UPSTREAM_RULES = [
-    (r"^ark-", "https://ark.cn-beijing.volces.com/api/coding"),
-    (r"^sk-.*dashscope", "https://dashscope.aliyuncs.com/apps/anthropic"),
-    (r"^sk-", "https://api.deepseek.com/anthropic"),
-]
+CCSWITCH_DB = Path.home() / ".cc-switch" / "cc-switch.db"
 
 # ────────────────────────────────────────
 # 配置
 # ────────────────────────────────────────
 
 def find_config():
-    """搜索 config.yaml，优先级: 当前目录 > ~/.config/input-refiner > ~/input-refiner > 内置"""
     paths = [
         Path("config.yaml"),
         Path.home() / ".config" / "input-refiner" / "config.yaml",
@@ -84,20 +75,15 @@ def find_config():
 
 
 def load_config():
-    """加载配置，文件缺失时返回内置默认值"""
     cfg_path = find_config()
     if cfg_path is None:
         return dict(DEFAULT_CONFIG)
-
     try:
         import yaml
     except ImportError:
         return dict(DEFAULT_CONFIG)
-
     with open(cfg_path) as f:
         user = yaml.safe_load(f) or {}
-
-    # 深度合并
     cfg = dict(DEFAULT_CONFIG)
     for section in cfg:
         if section in user and isinstance(user[section], dict):
@@ -107,33 +93,12 @@ def load_config():
     return cfg
 
 
-def detect_upstream(api_key, upstream_config):
-    """解析上游 URL — 优先查 map 表（API key 前缀匹配），兜底 default"""
-    if isinstance(upstream_config, str):
-        if upstream_config and upstream_config != "auto":
-            return upstream_config.rstrip("/")
-    elif isinstance(upstream_config, dict):
-        api_map = upstream_config.get("map", {})
-        for prefix, url in api_map.items():
-            if (api_key or "").startswith(prefix):
-                return url.rstrip("/")
-        default = upstream_config.get("default", "")
-        if default:
-            return default.rstrip("/")
-
-    # 最终兜底：旧式前缀匹配
-    for pattern, url in UPSTREAM_RULES:
-        if re.match(pattern, api_key or ""):
-            return url
-    return "https://api.deepseek.com/anthropic"
-
-
 # ────────────────────────────────────────
 # HTTP 代理
 # ────────────────────────────────────────
 
 def refine(text, config):
-    """调用本地模型精炼文本，失败时返回原文本"""
+    """调用本地模型精炼文本"""
     endpoint = config["refiner"]["endpoint"]
     prompt = config["prompt"]
     timeout = config["refiner"]["timeout"]
@@ -141,14 +106,8 @@ def refine(text, config):
 
     try:
         import httpx
-
-        # 用 completions 端点（绕过 gemma 等模型的 thinking 模式）
         completions_url = endpoint.rsplit("/chat/completions", 1)[0] + "/completions"
-        completion_prompt = (
-            f"{prompt}\n\n"
-            f"输入：{text}\n\n"
-            f"输出："
-        )
+        completion_prompt = f"{prompt}\n\n输入：{text}\n\n输出："
 
         resp = httpx.post(
             completions_url,
@@ -173,7 +132,7 @@ def refine(text, config):
 
 
 def log_refinement(original, refined, config):
-    """写日志文件"""
+    """写日志"""
     path = Path(config["log"]["path"])
     max_lines = config["log"]["max_lines"]
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -184,7 +143,6 @@ def log_refinement(original, refined, config):
         f"      精炼: {refined[:200]}\n"
         f"      节省: {max(0, len(original) - len(refined))} 字符\n"
     )
-
     lines = []
     if path.exists():
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -195,7 +153,6 @@ def log_refinement(original, refined, config):
 
 
 def update_hud(refined, config):
-    """写 HUD 状态文件"""
     if not config["hud"]["enabled"]:
         return
     max_len = config["hud"]["max_display_len"]
@@ -207,10 +164,24 @@ def update_hud(refined, config):
         pass
 
 
-class RefinerHandler(BaseHTTPRequestHandler):
-    """HTTP 请求处理器 — 先精炼，再透传"""
+def parse_upstream(path):
+    """从 path 提取上游 URL
 
-    # 类级别注入配置和日志
+    /proxy/api.deepseek.com/anthropic/v1/messages
+      → upstream: https://api.deepseek.com/anthropic
+      → api_path: /v1/messages
+    """
+    m = re.match(r"^/proxy/([^/]+(?:/[^/]+)*?)(?=/v[0-9]+/)", path)
+    if not m:
+        return None, path
+    host_and_base = m.group(1)
+    upstream = f"https://{host_and_base}"
+    prefix = f"/proxy/{host_and_base}"
+    api_path = path[len(prefix):] if path.startswith(prefix) else path
+    return upstream, api_path or "/"
+
+
+class RefinerHandler(BaseHTTPRequestHandler):
     config = None
     logger = None
 
@@ -221,27 +192,37 @@ class RefinerHandler(BaseHTTPRequestHandler):
         config = self.config
         logger = self.logger
 
-        # 读取请求体
+        # 解析上游
+        upstream, api_path = parse_upstream(self.path)
+        if upstream is None:
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error":"invalid proxy path"}')
+            return
+
+        target_url = f"{upstream}{api_path}"
+        logger.debug("上游: %s", target_url)
+
+        # 读请求体
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
 
         try:
             data = json.loads(body)
         except json.JSONDecodeError:
-            self._proxy_raw(body)
+            self._proxy(body, target_url, False)
             return
 
         # scope 检查
         apps_scope = config["scope"].get("apps", [])
         if apps_scope:
-            # 从 User-Agent 或自定义头判断 app
             ua = self.headers.get("User-Agent", "")
-            app_match = any(a.lower() in ua.lower() for a in apps_scope)
-            if not app_match:
-                self._proxy_raw(body, data)
+            if not any(a.lower() in ua.lower() for a in apps_scope):
+                self._proxy(body, target_url, False)
                 return
 
-        # 提取 + 精炼最后一条 user message
+        # 精炼最后一条 user message
         messages = data.get("messages", [])
         refined = False
         for i in range(len(messages) - 1, -1, -1):
@@ -251,16 +232,14 @@ class RefinerHandler(BaseHTTPRequestHandler):
                     skip_prefix = config["skip_prefix"]
                     if skip_prefix and content.startswith(skip_prefix):
                         messages[i]["content"] = content[len(skip_prefix):].lstrip()
-                        logger.info("跳过精炼 (%s 前缀)", skip_prefix)
+                        logger.info("跳过精炼 (%s)", skip_prefix)
                     else:
                         logger.info("精炼中... (%d 字符)", len(content))
                         start = time.time()
                         refined_text = refine(content, config)
                         elapsed = time.time() - start
-                        logger.info(
-                            "精炼完成 (%.1fs): %d → %d 字符",
-                            elapsed, len(content), len(refined_text),
-                        )
+                        logger.info("精炼完成 (%.1fs): %d → %d 字符",
+                                    elapsed, len(content), len(refined_text))
                         log_refinement(content, refined_text, config)
                         update_hud(refined_text, config)
                         messages[i]["content"] = refined_text
@@ -271,33 +250,22 @@ class RefinerHandler(BaseHTTPRequestHandler):
             data["messages"] = messages
             body = json.dumps(data).encode("utf-8")
 
-        self._proxy_raw(body, data, refined)
+        self._proxy(body, target_url, refined)
 
-    def _proxy_raw(self, body, data=None, was_refined=False):
-        """转发请求到上游并流式返回"""
+    def _proxy(self, body, target_url, was_refined=False):
         config = self.config
         logger = self.logger
 
-        # 解析上游
-        api_key = self.headers.get("x-api-key", "")
-        if data is not None and "upstream" in data.get("__meta__", {}):
-            upstream = data["__meta__"]["upstream"]
-        else:
-            upstream = detect_upstream(api_key, config.get("upstream", "auto"))
-
-        # 目标 URL — 保持原路径
-        target_path = self.path
-        target_url = f"{upstream}{target_path}"
-
-        # 构造请求头（透传但去掉 hop-by-hop）
+        # 构造请求头
         fwd_headers = {}
-        skip = {"host", "connection", "transfer-encoding", "keep-alive", "proxy-connection",
-                "proxy-authenticate", "proxy-authorization", "te", "trailer", "upgrade"}
+        skip_hdrs = {"host", "connection", "transfer-encoding", "keep-alive",
+                      "proxy-connection", "proxy-authenticate", "proxy-authorization",
+                      "te", "trailer", "upgrade"}
         for k, v in self.headers.items():
-            if k.lower() not in skip:
+            if k.lower() not in skip_hdrs:
                 fwd_headers[k] = v
 
-        # 修正 Content-Length（精炼后 body 长度可能变化）
+        # 修正 Content-Length
         for k in list(fwd_headers.keys()):
             if k.lower() == "content-length":
                 del fwd_headers[k]
@@ -313,21 +281,13 @@ class RefinerHandler(BaseHTTPRequestHandler):
                 timeout=config["refiner"]["timeout"] + 120,
                 proxy=None, trust_env=False,
             ) as resp:
-                # 回传状态码
                 self.send_response(resp.status_code)
-
-                # 回传响应头
                 for k, v in resp.headers.items():
-                    if k.lower() not in skip:
+                    if k.lower() not in skip_hdrs:
                         self.send_header(k, v)
-
-                # 添加精炼标记头（调试用）
                 if was_refined:
                     self.send_header("X-Refiner-Processed", "1")
-
                 self.end_headers()
-
-                # 流式回传 body
                 for chunk in resp.iter_bytes(8192):
                     try:
                         self.wfile.write(chunk)
@@ -341,13 +301,13 @@ class RefinerHandler(BaseHTTPRequestHandler):
                 self.send_response(502)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                err = json.dumps({"error": f"input-refiner: upstream unreachable: {e}"})
-                self.wfile.write(err.encode())
+                self.wfile.write(
+                    json.dumps({"error": f"input-refiner: upstream unreachable: {e}"}).encode()
+                )
             except Exception:
                 pass
 
     def do_GET(self):
-        """健康检查"""
         if self.path == "/health":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -368,7 +328,6 @@ class RefinerHandler(BaseHTTPRequestHandler):
 # ────────────────────────────────────────
 
 def get_docker_container():
-    """找到 llama.cpp Docker 容器"""
     try:
         result = subprocess.run(
             ["docker", "ps", "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}",
@@ -386,7 +345,6 @@ def get_docker_container():
 
 
 def get_container_config(container_id):
-    """获取容器的挂载信息和当前模型路径"""
     try:
         result = subprocess.run(
             ["docker", "inspect", container_id],
@@ -407,16 +365,13 @@ def get_container_config(container_id):
 
 
 def list_models(models_dir):
-    """列出所有 gguf 文件"""
     path = Path(models_dir)
     if not path.exists():
         return []
-    models = sorted(path.glob("*.gguf"))
-    return models
+    return sorted(path.glob("*.gguf"))
 
 
 def check_health(endpoint_base="http://localhost:8080", timeout=60):
-    """等待本地模型就绪"""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -431,15 +386,148 @@ def check_health(endpoint_base="http://localhost:8080", timeout=60):
 
 
 # ────────────────────────────────────────
+# setup / teardown
+# ────────────────────────────────────────
+
+def cmd_setup(config, args):
+    """一键接入：遍历 ccswitch 所有 provider，endpoint 指向 refiner"""
+    port = getattr(args, "port", 18888)
+    proxy_prefix = f"http://localhost:{port}/proxy/"
+
+    if not CCSWITCH_DB.exists():
+        print(f"ccswitch 数据库未找到: {CCSWITCH_DB}")
+        sys.exit(1)
+
+    db = sqlite3.connect(str(CCSWITCH_DB))
+    db.row_factory = sqlite3.Row
+    cursor = db.cursor()
+
+    # 获取所有 provider
+    cursor.execute("SELECT id, app_type, name, settings_config FROM providers")
+    providers = cursor.fetchall()
+
+    updated = 0
+    skipped = 0
+
+    for row in providers:
+        pid = row["id"]
+        name = row["name"]
+        app_type = row["app_type"]
+
+        try:
+            cfg = json.loads(row["settings_config"])
+        except (json.JSONDecodeError, TypeError):
+            print(f"  ⚠ {name} ({app_type}): 配置解析失败，跳过")
+            skipped += 1
+            continue
+
+        # 从 env 中找到 base_url / endpoint
+        env = cfg.get("env", {})
+        current_url = env.get("ANTHROPIC_BASE_URL", "")
+        if not current_url:
+            # 可能是个 OpenAI 风格的 provider，试试 OPENAI_BASE_URL
+            current_url = env.get("OPENAI_BASE_URL", "") or env.get("BASE_URL", "")
+
+        if not current_url:
+            print(f"  - {name} ({app_type}): 无已知 endpoint，跳过")
+            skipped += 1
+            continue
+
+        # 跳过 localhost（本地模型，不需要精炼）
+        if "localhost" in current_url or "127.0.0.1" in current_url:
+            print(f"  - {name} ({app_type}): 本地端点，跳过")
+            skipped += 1
+            continue
+
+        if "localhost:" in current_url and "/proxy/" in current_url:
+            print(f"  - {name} ({app_type}): 已接入，跳过")
+            skipped += 1
+            continue
+
+        # 备份原始 URL
+        if "__refiner_original_url" not in cfg:
+            cfg["__refiner_original_url"] = current_url
+
+        # 计算 proxy path
+        parsed = current_url.replace("https://", "").replace("http://", "")
+        # 去掉可能的末尾斜杠
+        parsed = parsed.rstrip("/")
+        proxy_endpoint = proxy_prefix + parsed
+
+        env["ANTHROPIC_BASE_URL"] = proxy_endpoint
+        cfg["env"] = env
+        cfg["settings_config"] = json.dumps(cfg, ensure_ascii=False)
+
+        # 写回 DB
+        cursor.execute(
+            "UPDATE providers SET settings_config = ? WHERE id = ?",
+            (json.dumps(cfg, ensure_ascii=False), pid),
+        )
+        print(f"  ✓ {name} ({app_type}): {current_url} → {proxy_endpoint}")
+        updated += 1
+
+    db.commit()
+    db.close()
+
+    print(f"\n完成: {updated} 个 provider 已接入, {skipped} 个跳过")
+    print(f"\nrefiner 端口: {port}")
+    print(f"还原命令: refiner teardown")
+
+
+def cmd_teardown(config, args):
+    """一键还原：恢复所有 provider 的原始 endpoint"""
+    if not CCSWITCH_DB.exists():
+        print(f"ccswitch 数据库未找到: {CCSWITCH_DB}")
+        sys.exit(1)
+
+    db = sqlite3.connect(str(CCSWITCH_DB))
+    db.row_factory = sqlite3.Row
+    cursor = db.cursor()
+
+    cursor.execute("SELECT id, app_type, name, settings_config FROM providers")
+    providers = cursor.fetchall()
+
+    restored = 0
+
+    for row in providers:
+        pid = row["id"]
+        name = row["name"]
+        app_type = row["app_type"]
+
+        try:
+            cfg = json.loads(row["settings_config"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        original = cfg.pop("__refiner_original_url", None)
+        if original is None:
+            continue
+
+        env = cfg.get("env", {})
+        env["ANTHROPIC_BASE_URL"] = original
+        cfg["env"] = env
+
+        cursor.execute(
+            "UPDATE providers SET settings_config = ? WHERE id = ?",
+            (json.dumps(cfg, ensure_ascii=False), pid),
+        )
+        print(f"  ✓ {name} ({app_type}): 已还原 → {original}")
+        restored += 1
+
+    db.commit()
+    db.close()
+
+    print(f"\n完成: {restored} 个 provider 已还原")
+
+
+# ────────────────────────────────────────
 # CLI
 # ────────────────────────────────────────
 
 def cmd_serve(config, args):
-    """启动 HTTP 代理服务"""
     port = getattr(args, "port", 18888)
     host = getattr(args, "bind", "127.0.0.1")
 
-    # 配置日志
     logger = logging.getLogger("refiner")
     logger.setLevel(logging.DEBUG if getattr(args, "verbose", False) else logging.INFO)
     handler = logging.StreamHandler()
@@ -448,25 +536,26 @@ def cmd_serve(config, args):
     ))
     logger.handlers = [handler]
 
-    # 注入到 handler 类
     RefinerHandler.config = config
     RefinerHandler.logger = logger
 
     server = HTTPServer((host, port), RefinerHandler)
 
     def shutdown(sig, frame):
-        logger.info("正在关闭...")
-        server.shutdown()
+        logger.info("收到信号 %s，正在关闭...", sig)
+        # HTTPServer.shutdown() 必须从另一个线程调用
+        import threading
+        t = threading.Thread(target=server.shutdown, daemon=True)
+        t.start()
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
     logger.info("input-refiner 已启动 → http://%s:%d", host, port)
     logger.info("精炼端点: %s", config["refiner"]["endpoint"])
-    logger.info("上游模式: %s", config.get("upstream", "auto"))
     logger.info("跳过前缀: %s", config.get("skip_prefix", "!!!"))
     logger.info("")
-    logger.info("ccswitch provider endpoint 请设置为: http://%s:%d/v1/messages", host, port)
+    logger.info("接入命令: refiner setup")
     logger.info("健康检查: http://%s:%d/health", host, port)
 
     try:
@@ -479,10 +568,8 @@ def cmd_serve(config, args):
 
 
 def cmd_models(config, args):
-    """列出所有可用模型"""
     models_dir = config["refiner"]["models_dir"]
     models = list_models(models_dir)
-
     if not models:
         print(f"在 {models_dir} 下未找到 .gguf 文件")
         return
@@ -499,7 +586,6 @@ def cmd_models(config, args):
 
 
 def cmd_switch(config, args):
-    """切换模型 — 重启 Docker 容器"""
     target = args.name
     models_dir = config["refiner"]["models_dir"]
     models = list_models(models_dir)
@@ -522,7 +608,6 @@ def cmd_switch(config, args):
         print(f"请手动启动并指定模型: --model /models/{match.name}")
         sys.exit(1)
 
-    # 获取当前容器的完整命令
     result = subprocess.run(
         ["docker", "inspect", cid], capture_output=True, text=True, timeout=5
     )
@@ -531,7 +616,6 @@ def cmd_switch(config, args):
     old_cmd = info["Config"].get("Cmd") or []
     full_cmd = entrypoint + old_cmd
 
-    # 替换 --model 参数
     new_cmd = []
     skip = False
     for arg in full_cmd:
@@ -544,7 +628,6 @@ def cmd_switch(config, args):
         else:
             new_cmd.append(arg)
 
-    # 提取挂载和端口映射用于重建
     mounts_args = []
     for mnt in info.get("Mounts", []):
         mounts_args.extend(["-v", f"{mnt['Source']}:{mnt['Destination']}"])
@@ -564,12 +647,12 @@ def cmd_switch(config, args):
             gpu_args = ["--gpus", "all"]
             break
 
-    # 先 rm 旧容器，再启动新的
     print(f"停止并删除旧容器 {cname}...")
     subprocess.run(["docker", "stop", cid], capture_output=True, timeout=30)
     subprocess.run(["docker", "rm", cid], capture_output=True, timeout=10)
 
-    run_cmd = ["docker", "run", "-d", "--name", cname] + gpu_args + port_args + mounts_args + env_args + [cimage] + new_cmd
+    run_cmd = (["docker", "run", "-d", "--name", cname] + gpu_args +
+               port_args + mounts_args + env_args + [cimage] + new_cmd)
 
     print(f"启动新容器 {cname}，模型: {match.name}...")
     result = subprocess.run(run_cmd, capture_output=True, text=True, timeout=30)
@@ -580,7 +663,6 @@ def cmd_switch(config, args):
     new_cid = result.stdout.strip()[:12]
     print(f"容器 {new_cid} 已启动")
 
-    # 等待就绪
     print("等待模型加载", end="", flush=True)
     if check_health(timeout=120):
         print(" ✓")
@@ -590,7 +672,6 @@ def cmd_switch(config, args):
 
 
 def cmd_status(config, args):
-    """查看当前状态"""
     cid, cname, cimage = get_docker_container()
 
     print("input-refiner 状态\n")
@@ -601,11 +682,9 @@ def cmd_status(config, args):
         _, current = get_container_config(cid)
         print(f"{'当前模型:':<16} {Path(current).stem if current else '未知'}")
 
-    # 健康检查
     healthy = check_health(timeout=3)
     print(f"{'健康状态:':<16} {'✓ 正常' if healthy else '✗ 不可达'}")
 
-    # refiner 代理状态
     try:
         from httpx import get as httpx_get
         resp = httpx_get("http://localhost:18888/health", timeout=2, proxy=None, trust_env=False)
@@ -618,20 +697,21 @@ def main():
     parser = argparse.ArgumentParser(description="input-refiner — 本地模型输入精炼代理")
     sub = parser.add_subparsers(dest="command")
 
-    # serve
-    p_serve = sub.add_parser("serve", help="启动 HTTP 代理")
-    p_serve.add_argument("--port", type=int, default=18888, help="监听端口 (默认 18888)")
-    p_serve.add_argument("--bind", default="127.0.0.1", help="绑定地址 (默认 127.0.0.1)")
-    p_serve.add_argument("-v", "--verbose", action="store_true", help="调试模式")
+    p_setup = sub.add_parser("setup", help="一键接入 ccswitch")
+    p_setup.add_argument("--port", type=int, default=18888)
 
-    # models
+    sub.add_parser("teardown", help="一键还原")
+
+    p_serve = sub.add_parser("serve", help="启动 HTTP 代理")
+    p_serve.add_argument("--port", type=int, default=18888)
+    p_serve.add_argument("--bind", default="127.0.0.1")
+    p_serve.add_argument("-v", "--verbose", action="store_true")
+
     sub.add_parser("models", help="列出可用 gguf 模型")
 
-    # switch
     p_switch = sub.add_parser("switch", help="切换模型")
     p_switch.add_argument("name", help="模型名 (模糊匹配)")
 
-    # status
     sub.add_parser("status", help="查看当前状态")
 
     args = parser.parse_args()
@@ -642,14 +722,15 @@ def main():
 
     config = load_config()
 
-    if args.command == "serve":
-        cmd_serve(config, args)
-    elif args.command == "models":
-        cmd_models(config, args)
-    elif args.command == "switch":
-        cmd_switch(config, args)
-    elif args.command == "status":
-        cmd_status(config, args)
+    commands = {
+        "setup": cmd_setup,
+        "teardown": cmd_teardown,
+        "serve": cmd_serve,
+        "models": cmd_models,
+        "switch": cmd_switch,
+        "status": cmd_status,
+    }
+    commands[args.command](config, args)
 
 
 if __name__ == "__main__":

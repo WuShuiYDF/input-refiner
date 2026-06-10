@@ -77,14 +77,18 @@ mkdir -p "$SYSTEMD_DIR"
 cat > "$SYSTEMD_DIR/input-refiner.service" << UNIT
 [Unit]
 Description=input-refiner — 本地模型输入精炼代理
-After=network-online.target
+After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$INSTALL_BIN serve
+ExecStartPre=$INSTALL_BIN setup --port 18888
+ExecStart=$INSTALL_BIN serve --port 18888
+ExecStopPost=$INSTALL_BIN teardown
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=5
+KillSignal=SIGKILL
 Environment=PYTHONUNBUFFERED=1
 
 [Install]
@@ -99,18 +103,20 @@ echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  安装完成!"
 echo ""
-echo "  启动服务:"
+echo "  启动服务 (已设置开机自启):"
 echo "    systemctl --user enable --now input-refiner"
-echo "    # 或手动: refiner serve"
 echo ""
 echo "  日常命令:"
+echo "    refiner setup         一键接入 (启动时自动执行)"
+echo "    refiner teardown      一键还原 (关机时自动执行)"
 echo "    refiner serve         启动代理 (:18888)"
 echo "    refiner models        列出可用模型"
 echo "    refiner switch xxx    切换模型"
 echo "    refiner status        查看状态"
 echo ""
-echo "  健康检查: curl http://localhost:18888/health"
+echo "  自启说明:"
+echo "    开机 → setup(接入) + serve(代理)"
+echo "    关机 → teardown(还原原endpoint)"
 echo ""
-echo "  ⚠ 下一步: 在 ccswitch 中将 provider 的 endpoint"
-echo "    改为 http://localhost:18888/v1/messages"
+echo "  健康检查: curl http://localhost:18888/health"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

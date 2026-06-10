@@ -20,15 +20,7 @@ prompt: |
 # ── 跳过标记 ──
 skip_prefix: "!!!"
 
-# ── 上游 LLM（按 API key 前缀匹配真实端点） ──
-upstream:
-  default: https://api.deepseek.com/anthropic
-  map:
-    "sk-a6ab": "https://api.deepseek.com/anthropic"
-    "sk-2430": "https://dashscope.aliyuncs.com/apps/anthropic"
-    "ark-730": "https://ark.cn-beijing.volces.com/api/coding"
-
-# ── 适用范围 ──
+# ── 适用范围（仅当 scope.apps 非空时生效） ──
 scope:
   apps: []
 
